@@ -19,7 +19,7 @@ import fitz
 import markdown
 from bs4 import BeautifulSoup
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt, RGBColor
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -279,84 +279,448 @@ def pdf_to_txt(input_path: Path, output_path: Path) -> None:
     output_path.write_text("\n\n".join(parts), encoding="utf-8")
 
 
+def _clean_pdf_font_name(name: str) -> str:
+    """Remove common PDF subset prefixes from embedded font names."""
+    value = str(name or "").strip()
+
+    if "+" in value:
+        value = value.split("+", 1)[1]
+
+    return value or "Arial"
+
+
+def _rgb_from_pdf_color(value: int) -> RGBColor:
+    """Convert PyMuPDF's integer RGB color into python-docx RGBColor."""
+    value = int(value or 0)
+
+    return RGBColor(
+        (value >> 16) & 255,
+        (value >> 8) & 255,
+        value & 255,
+    )
+
+
+def _bbox_inside_table(
+    bbox: tuple[float, float, float, float],
+    table_boxes: list[tuple[float, float, float, float]],
+) -> bool:
+    """Avoid duplicating text that is later recreated as a Word table."""
+    x0, y0, x1, y1 = bbox
+    center_x = (x0 + x1) / 2
+    center_y = (y0 + y1) / 2
+
+    for tx0, ty0, tx1, ty1 in table_boxes:
+        if (
+            tx0 <= center_x <= tx1
+            and
+            ty0 <= center_y <= ty1
+        ):
+            return True
+
+    return False
+
+
+def _add_pdf_image_to_docx(
+    paragraph,
+    image_bytes: bytes,
+    width_points: float,
+) -> None:
+    """Insert a PDF image block, converting unusual formats to PNG if needed."""
+    if not image_bytes:
+        return
+
+    width_points = max(
+        24.0,
+        min(
+            520.0,
+            float(width_points or 220.0),
+        ),
+    )
+
+    try:
+        paragraph.add_run().add_picture(
+            io.BytesIO(image_bytes),
+            width=Pt(width_points),
+        )
+        return
+    except Exception:
+        pass
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            converted = io.BytesIO()
+
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGB")
+
+            image.save(
+                converted,
+                format="PNG",
+            )
+            converted.seek(0)
+
+            paragraph.add_run().add_picture(
+                converted,
+                width=Pt(width_points),
+            )
+    except Exception:
+        # A malformed image should not cause the entire PDF -> Word job to fail.
+        return
+
+
+def _fast_pdf_to_docx(
+    input_path: Path,
+    output_path: Path,
+) -> None:
+    """
+    Fast editable PDF -> DOCX reconstruction.
+
+    This path intentionally avoids pdf2docx's expensive page-layout heuristics.
+    It rebuilds the document directly from PyMuPDF text spans, detected tables,
+    and embedded image blocks. Text remains editable, common font styling and
+    colors are retained, tables are recreated, and the original page dimensions
+    are used for the Word document.
+    """
+    source = fitz.open(input_path)
+
+    if len(source) == 0:
+        source.close()
+        raise RuntimeError(
+            "The PDF contains no pages."
+        )
+
+    document = Document()
+
+    # Remove the default blank paragraph's spacing so page positioning starts
+    # closer to the PDF's original top edge.
+    if document.paragraphs:
+        default_paragraph = document.paragraphs[0]
+        default_paragraph.paragraph_format.space_after = Pt(0)
+        default_paragraph.paragraph_format.space_before = Pt(0)
+
+    for page_index, page in enumerate(source):
+        page_rect = page.rect
+
+        section = document.sections[-1]
+        section.page_width = Pt(page_rect.width)
+        section.page_height = Pt(page_rect.height)
+
+        # Small margins leave room for Word's layout engine while still
+        # preserving most of the PDF's usable page area.
+        margin = 18.0
+        section.left_margin = Pt(margin)
+        section.right_margin = Pt(margin)
+        section.top_margin = Pt(margin)
+        section.bottom_margin = Pt(margin)
+
+        table_items: list[dict[str, Any]] = []
+        table_boxes: list[tuple[float, float, float, float]] = []
+
+        # PyMuPDF's native table finder is dramatically cheaper than full
+        # pdf2docx reconstruction and gives us genuinely editable Word tables.
+        try:
+            finder = page.find_tables()
+
+            for table in finder.tables:
+                bbox = tuple(float(v) for v in table.bbox)
+                rows = table.extract()
+
+                if not rows:
+                    continue
+
+                table_boxes.append(bbox)
+                table_items.append({
+                    "kind": "table",
+                    "bbox": bbox,
+                    "rows": rows,
+                })
+        except Exception:
+            # Table detection is best-effort. Text extraction still proceeds.
+            table_items = []
+            table_boxes = []
+
+        page_dict = page.get_text(
+            "dict",
+            sort=True,
+        )
+
+        content_items: list[dict[str, Any]] = []
+
+        for block in page_dict.get("blocks", []):
+            bbox = tuple(
+                float(v)
+                for v in block.get(
+                    "bbox",
+                    (0, 0, 0, 0),
+                )
+            )
+
+            block_type = int(
+                block.get("type", 0)
+            )
+
+            if (
+                block_type == 0
+                and
+                _bbox_inside_table(
+                    bbox,
+                    table_boxes,
+                )
+            ):
+                continue
+
+            if block_type == 0:
+                content_items.append({
+                    "kind": "text",
+                    "bbox": bbox,
+                    "block": block,
+                })
+
+            elif block_type == 1:
+                content_items.append({
+                    "kind": "image",
+                    "bbox": bbox,
+                    "image": block.get("image", b""),
+                })
+
+        content_items.extend(
+            table_items
+        )
+
+        content_items.sort(
+            key=lambda item: (
+                item["bbox"][1],
+                item["bbox"][0],
+            )
+        )
+
+        previous_bottom = margin
+
+        for item in content_items:
+            x0, y0, x1, y1 = item["bbox"]
+            vertical_gap = max(
+                0.0,
+                y0 - previous_bottom,
+            )
+
+            if item["kind"] == "text":
+                paragraph = document.add_paragraph()
+                formatting = paragraph.paragraph_format
+
+                formatting.space_before = Pt(
+                    min(
+                        36.0,
+                        vertical_gap,
+                    )
+                )
+                formatting.space_after = Pt(0)
+                formatting.left_indent = Pt(
+                    max(
+                        0.0,
+                        x0 - margin,
+                    )
+                )
+                formatting.right_indent = Pt(
+                    max(
+                        0.0,
+                        page_rect.width - x1 - margin,
+                    )
+                )
+                formatting.line_spacing = 1.0
+
+                lines = item["block"].get(
+                    "lines",
+                    [],
+                )
+
+                for line_index, line in enumerate(lines):
+                    spans = line.get(
+                        "spans",
+                        [],
+                    )
+
+                    for span in spans:
+                        text = str(
+                            span.get("text", "")
+                        )
+
+                        if not text:
+                            continue
+
+                        run = paragraph.add_run(
+                            text
+                        )
+
+                        font = run.font
+                        font.name = _clean_pdf_font_name(
+                            span.get("font", "Arial")
+                        )
+
+                        font.size = Pt(
+                            max(
+                                5.0,
+                                min(
+                                    72.0,
+                                    float(
+                                        span.get("size", 11.0)
+                                    ),
+                                ),
+                            )
+                        )
+
+                        flags = int(
+                            span.get("flags", 0)
+                        )
+                        font.bold = bool(
+                            flags & 16
+                        )
+                        font.italic = bool(
+                            flags & 2
+                        )
+
+                        try:
+                            font.color.rgb = _rgb_from_pdf_color(
+                                span.get("color", 0)
+                            )
+                        except Exception:
+                            pass
+
+                    if line_index < len(lines) - 1:
+                        paragraph.add_run().add_break()
+
+            elif item["kind"] == "table":
+                rows = item["rows"]
+                column_count = max(
+                    (
+                        len(row or [])
+                        for row in rows
+                    ),
+                    default=0,
+                )
+
+                if column_count:
+                    spacer = document.add_paragraph()
+                    spacer.paragraph_format.space_before = Pt(
+                        min(
+                            24.0,
+                            vertical_gap,
+                        )
+                    )
+                    spacer.paragraph_format.space_after = Pt(0)
+
+                    word_table = document.add_table(
+                        rows=len(rows),
+                        cols=column_count,
+                    )
+                    word_table.style = "Table Grid"
+
+                    for row_index, row in enumerate(rows):
+                        row = row or []
+
+                        for column_index in range(column_count):
+                            value = (
+                                row[column_index]
+                                if column_index < len(row)
+                                else ""
+                            )
+
+                            word_table.cell(
+                                row_index,
+                                column_index,
+                            ).text = str(
+                                value or ""
+                            )
+
+            elif item["kind"] == "image":
+                paragraph = document.add_paragraph()
+                paragraph.paragraph_format.space_before = Pt(
+                    min(
+                        24.0,
+                        vertical_gap,
+                    )
+                )
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.left_indent = Pt(
+                    max(
+                        0.0,
+                        x0 - margin,
+                    )
+                )
+
+                _add_pdf_image_to_docx(
+                    paragraph,
+                    item.get("image", b""),
+                    max(
+                        24.0,
+                        x1 - x0,
+                    ),
+                )
+
+            previous_bottom = max(
+                previous_bottom,
+                y1,
+            )
+
+        if page_index < len(source) - 1:
+            document.add_page_break()
+
+    source.close()
+
+    document.save(
+        output_path
+    )
+
+
 def pdf_to_docx(
     input_path: Path,
     output_path: Path,
 ) -> None:
     """
-    Convert PDF -> editable DOCX with layout reconstruction.
+    MazeDocs fast PDF -> Word route.
 
-    For larger PDFs, pdf2docx multiprocessing is enabled so separate
-    page ranges can be parsed in parallel. Small PDFs stay single-process
-    because process startup/merge overhead can make them slower.
+    Large/normal documents use the direct PyMuPDF reconstruction path so a
+    conversion does not spend several minutes inside pdf2docx heuristics.
+    Tiny PDFs can still use pdf2docx for maximum layout fidelity because the
+    overhead is usually acceptable there.
     """
+    with fitz.open(input_path) as source_pdf:
+        page_count = len(source_pdf)
 
-    converter = None
+    if page_count == 0:
+        raise RuntimeError(
+            "The PDF contains no pages."
+        )
 
-    try:
-        with fitz.open(input_path) as source_pdf:
-            page_count = len(source_pdf)
+    # Keep high-fidelity pdf2docx only for very small documents where it is
+    # unlikely to create the multi-minute conversion problem seen in production.
+    if page_count <= 3:
+        converter = None
 
-        if page_count == 0:
-            raise RuntimeError(
-                "The PDF contains no pages."
+        try:
+            converter = PDFToDOCXConverter(
+                str(input_path)
             )
-
-        converter = PDFToDOCXConverter(
-            str(input_path)
-        )
-
-        # Railway may expose more logical CPUs than are actually useful.
-        # Cap at 4 workers to avoid excessive RAM/process overhead.
-        detected_cpus = (
-            os.cpu_count()
-            or
-            1
-        )
-
-        worker_count = max(
-            1,
-            min(
-                4,
-                detected_cpus,
-                page_count,
-            ),
-        )
-
-        # Multiprocessing becomes worthwhile mainly on multi-page PDFs.
-        use_multiprocessing = (
-            page_count >= 8
-            and
-            worker_count >= 2
-        )
-
-        if use_multiprocessing:
-            converter.convert(
-                str(output_path),
-                start=0,
-                end=page_count,
-                multi_processing=True,
-                cpu_count=worker_count,
-            )
-        else:
             converter.convert(
                 str(output_path)
             )
-
-    except RuntimeError:
-        raise
-
-    except Exception as error:
-        raise RuntimeError(
-            f"PDF to Word conversion failed: {error}"
-        ) from error
-
-    finally:
-        if converter is not None:
-            try:
-                converter.close()
-            except Exception:
-                pass
+        except Exception as error:
+            # If pdf2docx has trouble with the PDF, immediately fall back to
+            # the fast reconstruction rather than leaving the job stuck.
+            _fast_pdf_to_docx(
+                input_path,
+                output_path,
+            )
+        finally:
+            if converter is not None:
+                try:
+                    converter.close()
+                except Exception:
+                    pass
+    else:
+        _fast_pdf_to_docx(
+            input_path,
+            output_path,
+        )
 
     if (
         not output_path.exists()
