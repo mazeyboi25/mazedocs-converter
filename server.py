@@ -7,6 +7,9 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import time
+import uuid
 import tempfile
 import zipfile
 from pathlib import Path
@@ -17,7 +20,7 @@ import markdown
 from bs4 import BeautifulSoup
 from docx import Document
 from docx.shared import Inches
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
@@ -59,6 +62,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -948,6 +952,239 @@ def health_payload() -> dict[str, Any]:
     }
 
 
+# ============================================================
+# BACKGROUND CONVERSION JOBS
+# ============================================================
+
+JOB_RETENTION_SECONDS = 2 * 60 * 60
+JOBS: dict[str, dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
+
+
+def _remove_job(job_id: str) -> None:
+    with JOBS_LOCK:
+        job = JOBS.pop(job_id, None)
+
+    if not job:
+        return
+
+    workdir = Path(job.get("workdir", ""))
+
+    if workdir.exists():
+        shutil.rmtree(
+            workdir,
+            ignore_errors=True,
+        )
+
+
+def _cleanup_old_jobs() -> None:
+    now = time.time()
+    stale: list[str] = []
+
+    with JOBS_LOCK:
+        for job_id, job in JOBS.items():
+            if job.get("status") == "processing":
+                continue
+
+            created_at = float(
+                job.get("created_at", now)
+            )
+
+            if (
+                now - created_at
+                >
+                JOB_RETENTION_SECONDS
+            ):
+                stale.append(job_id)
+
+    for job_id in stale:
+        _remove_job(job_id)
+
+
+def _run_conversion_job(job_id: str) -> None:
+    """
+    Run a conversion after the upload request has already returned.
+
+    This is intentionally separate from the upload request so Railway does
+    not see one long silent HTTP request while pdf2docx / LibreOffice works.
+    """
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+
+        if not job:
+            return
+
+        job["status"] = "processing"
+        job["stage"] = "converting"
+        job["started_at"] = time.time()
+
+        input_path = Path(job["input_path"])
+        workdir = Path(job["workdir"])
+        source = str(job["source"])
+        target = str(job["target"])
+        original_name = str(job["filename"])
+
+    try:
+        output_path = convert_file(
+            input_path,
+            source,
+            target,
+            workdir,
+        )
+
+        if (
+            not output_path.exists()
+            or
+            output_path.stat().st_size == 0
+        ):
+            raise RuntimeError(
+                "The converter did not produce a valid output file."
+            )
+
+        final_name = output_path.name
+
+        if output_path.stem.startswith("source"):
+            final_name = output_path.name.replace(
+                "source",
+                safe_stem(original_name),
+                1,
+            )
+
+        with JOBS_LOCK:
+            current = JOBS.get(job_id)
+
+            if current is not None:
+                current.update({
+                    "status": "done",
+                    "stage": "ready",
+                    "finished_at": time.time(),
+                    "output_path": str(output_path),
+                    "download_name": final_name,
+                    "output_size": output_path.stat().st_size,
+                })
+
+    except Exception as error:
+        with JOBS_LOCK:
+            current = JOBS.get(job_id)
+
+            if current is not None:
+                current.update({
+                    "status": "error",
+                    "stage": "failed",
+                    "finished_at": time.time(),
+                    "error": str(error),
+                })
+
+
+async def _save_job_upload(
+    file: UploadFile,
+    target: str,
+) -> str:
+    filename = file.filename or "upload"
+    source = source_extension(filename)
+    target = target.lower().strip().lstrip(".")
+
+    if source not in ROUTES:
+        raise HTTPException(
+            400,
+            f".{source or '?'} is not supported.",
+        )
+
+    valid_targets = {
+        route["target"]
+        for route in ROUTES[source]
+    }
+
+    if target not in valid_targets:
+        raise HTTPException(
+            400,
+            f"Cannot convert .{source} to .{target}.",
+        )
+
+    route = next(
+        route
+        for route in ROUTES[source]
+        if route["target"] == target
+    )
+
+    if (
+        route.get("requires_libreoffice")
+        and
+        not find_libreoffice()
+    ):
+        raise HTTPException(
+            422,
+            "This conversion route requires LibreOffice.",
+        )
+
+    _cleanup_old_jobs()
+
+    job_id = uuid.uuid4().hex
+    workdir = Path(
+        tempfile.mkdtemp(
+            prefix=f"mazedocs-job-{job_id[:8]}-"
+        )
+    )
+    input_path = workdir / f"source.{source}"
+
+    received_bytes = 0
+    chunk_size = 1024 * 1024
+
+    try:
+        with input_path.open("wb") as destination:
+            while True:
+                chunk = await file.read(chunk_size)
+
+                if not chunk:
+                    break
+
+                received_bytes += len(chunk)
+
+                if received_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        413,
+                        (
+                            "This file is larger than the MazeDocs "
+                            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB "
+                            "application limit."
+                        ),
+                    )
+
+                destination.write(chunk)
+
+        if received_bytes == 0:
+            raise HTTPException(
+                400,
+                "The uploaded file is empty.",
+            )
+
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "id": job_id,
+                "status": "queued",
+                "stage": "queued",
+                "created_at": time.time(),
+                "filename": filename,
+                "source": source,
+                "target": target,
+                "size": received_bytes,
+                "workdir": str(workdir),
+                "input_path": str(input_path),
+            }
+
+        return job_id
+
+    except Exception:
+        shutil.rmtree(
+            workdir,
+            ignore_errors=True,
+        )
+        raise
+
+    finally:
+        await file.close()
+
+
 async def convert_upload(
     file: UploadFile,
     target: str,
@@ -1122,6 +1359,140 @@ async def convert_upload(
 
     finally:
         await file.close()
+
+
+@app.post("/api/jobs", status_code=202)
+async def create_conversion_job(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    target: str = Form(...),
+) -> dict[str, Any]:
+    """
+    Upload the source file, return immediately with a job id, and run the
+    expensive conversion after the HTTP upload request has finished.
+    """
+    job_id = await _save_job_upload(
+        file,
+        target,
+    )
+
+    background_tasks.add_task(
+        _run_conversion_job,
+        job_id,
+    )
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/api/jobs/{job_id}",
+        "download_url": f"/api/jobs/{job_id}/download",
+    }
+
+
+@app.get("/api/jobs/{job_id}")
+def conversion_job_status(
+    job_id: str,
+) -> dict[str, Any]:
+    _cleanup_old_jobs()
+
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+
+        if not job:
+            raise HTTPException(
+                404,
+                "Conversion job was not found or has expired.",
+            )
+
+        payload = {
+            "ok": True,
+            "job_id": job_id,
+            "status": job.get("status"),
+            "stage": job.get("stage"),
+            "source": job.get("source"),
+            "target": job.get("target"),
+            "input_size": job.get("size"),
+        }
+
+        if job.get("status") == "done":
+            payload.update({
+                "filename": job.get("download_name"),
+                "output_size": job.get("output_size"),
+                "download_url": f"/api/jobs/{job_id}/download",
+            })
+
+        if job.get("status") == "error":
+            payload["error"] = job.get(
+                "error",
+                "Conversion failed.",
+            )
+
+        return payload
+
+
+@app.get("/api/jobs/{job_id}/download")
+def conversion_job_download(
+    job_id: str,
+) -> FileResponse:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+
+        if not job:
+            raise HTTPException(
+                404,
+                "Conversion job was not found or has expired.",
+            )
+
+        status = job.get("status")
+
+        if status == "error":
+            raise HTTPException(
+                422,
+                job.get("error", "Conversion failed."),
+            )
+
+        if status != "done":
+            raise HTTPException(
+                409,
+                "Conversion is still running.",
+            )
+
+        output_path = Path(
+            str(job.get("output_path", ""))
+        )
+        download_name = str(
+            job.get("download_name")
+            or
+            output_path.name
+        )
+
+    if (
+        not output_path.exists()
+        or
+        output_path.stat().st_size == 0
+    ):
+        _remove_job(job_id)
+
+        raise HTTPException(
+            410,
+            "The converted file is no longer available.",
+        )
+
+    cleanup = BackgroundTask(
+        _remove_job,
+        job_id,
+    )
+
+    return FileResponse(
+        path=output_path,
+        media_type=mime_for(output_path),
+        filename=download_name,
+        headers={
+            "Cache-Control": "no-store",
+        },
+        background=cleanup,
+    )
 
 
 @app.get("/api")
