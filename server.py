@@ -456,382 +456,262 @@ def _add_fixed_page_background(
     paragraph._p.append(run)
 
 
-def _append_styled_pdf_span(
-    text_paragraph,
-    span: dict[str, Any],
+def _add_fixed_text_line(
+    document: Document,
+    line_bbox,
+    spans: list[dict[str, Any]],
 ) -> None:
     """
-    Append one PDF span as a Word run while preserving the existing
-    font-family, size, bold/italic state, and color behavior.
-    """
-    span_text = str(
-        span.get("text", "")
-    )
+    Recreate one PDF text line as a lightweight, absolutely positioned
+    Word paragraph frame.
 
-    if not span_text:
+    Compared with VML text boxes, paragraph frames are far cheaper for Word
+    to open and render, while still keeping every PDF line at its own X/Y
+    position. This avoids the block reflow/overlap problem and keeps the
+    page visually much closer to the source PDF.
+    """
+    if not spans:
         return
 
-    text_run = OxmlElement(
-        "w:r"
-    )
-    run_properties = OxmlElement(
-        "w:rPr"
+    text_value = "".join(
+        str(span.get("text", ""))
+        for span in spans
     )
 
-    raw_font_name = str(
-        span.get(
-            "font",
-            "Arial",
-        )
-    )
-    font_name = _clean_pdf_font_name(
-        raw_font_name
-    )
-
-    fonts = OxmlElement(
-        "w:rFonts"
-    )
-    fonts.set(
-        qn("w:ascii"),
-        font_name,
-    )
-    fonts.set(
-        qn("w:hAnsi"),
-        font_name,
-    )
-    fonts.set(
-        qn("w:eastAsia"),
-        font_name,
-    )
-    run_properties.append(
-        fonts
-    )
-
-    font_size = max(
-        5.0,
-        min(
-            72.0,
-            float(
-                span.get(
-                    "size",
-                    10.0,
-                )
-            ),
-        ),
-    )
-
-    half_points = str(
-        max(
-            10,
-            round(font_size * 2),
-        )
-    )
-
-    size = OxmlElement(
-        "w:sz"
-    )
-    size.set(
-        qn("w:val"),
-        half_points,
-    )
-    run_properties.append(
-        size
-    )
-
-    complex_size = OxmlElement(
-        "w:szCs"
-    )
-    complex_size.set(
-        qn("w:val"),
-        half_points,
-    )
-    run_properties.append(
-        complex_size
-    )
-
-    font_name_lower = raw_font_name.lower()
-    flags = int(
-        span.get(
-            "flags",
-            0,
-        )
-    )
-
-    if (
-        "bold" in font_name_lower
-        or
-        flags & 16
-    ):
-        run_properties.append(
-            OxmlElement("w:b")
-        )
-
-    if (
-        "italic" in font_name_lower
-        or
-        "oblique" in font_name_lower
-        or
-        flags & 2
-    ):
-        run_properties.append(
-            OxmlElement("w:i")
-        )
-
-    color = OxmlElement(
-        "w:color"
-    )
-    color.set(
-        qn("w:val"),
-        _pdf_color_hex(
-            span.get(
-                "color",
-                0,
-            )
-        ),
-    )
-    run_properties.append(
-        color
-    )
-
-    text_run.append(
-        run_properties
-    )
-
-    text_node = OxmlElement(
-        "w:t"
-    )
-    text_node.set(
-        f"{{{_XML_NS}}}space",
-        "preserve",
-    )
-    text_node.text = span_text
-    text_run.append(
-        text_node
-    )
-    text_paragraph.append(
-        text_run
-    )
-
-
-def _add_fixed_text_block(
-    paragraph,
-    block_bbox,
-    lines: list[dict[str, Any]],
-    shape_index: int,
-) -> None:
-    """
-    Recreate one PDF text BLOCK as one fixed-position editable Word textbox.
-
-    This preserves all text, styling, and line placement while dramatically
-    reducing the number of top-level Word drawing objects compared with the
-    old one-textbox-per-line representation.
-
-    No page background quality, text content, font size, font color, or page
-    count is reduced by this optimization.
-    """
-    if not lines:
+    if not text_value.strip():
         return
 
     x0, y0, x1, y1 = (
         float(value)
-        for value in block_bbox
+        for value in line_bbox
     )
 
-    width = max(
+    width_points = max(
         8.0,
-        (x1 - x0) * 1.16 + 6.0,
+        (x1 - x0) * 1.12 + 4.0,
     )
-    height = max(
+
+    height_points = max(
         8.0,
-        (y1 - y0) * 1.20 + 5.0,
+        (y1 - y0) * 1.35 + 2.0,
     )
 
-    run = OxmlElement(
-        "w:r"
-    )
-    picture = OxmlElement(
-        "w:pict"
-    )
+    paragraph = document.add_paragraph()
 
-    shape = _vml_element(
-        _VML_NS,
-        "shape",
-        {
-            "id": f"MazeDocsEditableBlock{shape_index}",
-            "filled": "f",
-            "stroked": "f",
-            "style": (
-                "position:absolute;"
-                f"margin-left:{x0:.3f}pt;"
-                f"margin-top:{max(0.0, y0 - 1.4):.3f}pt;"
-                f"width:{width:.3f}pt;"
-                f"height:{height:.3f}pt;"
-                "z-index:10;"
-                "mso-position-horizontal-relative:page;"
-                "mso-position-vertical-relative:page;"
-                "mso-fit-shape-to-text:t;"
-            ),
-        },
+    p_pr = paragraph._p.get_or_add_pPr()
+
+    # Absolute frame coordinates are expressed in twips.
+    frame = OxmlElement(
+        "w:framePr"
     )
-
-    textbox = _vml_element(
-        _VML_NS,
-        "textbox",
-        {
-            "inset": "0,0,0,0",
-        },
-    )
-
-    textbox_content = OxmlElement(
-        "w:txbxContent"
-    )
-
-    previous_line_bottom = y0
-
-    for line_index, line in enumerate(lines):
-        spans = list(
-            line.get(
-                "spans",
-                [],
+    frame.set(
+        qn("w:w"),
+        str(
+            max(
+                1,
+                round(width_points * 20),
             )
+        ),
+    )
+    frame.set(
+        qn("w:h"),
+        str(
+            max(
+                1,
+                round(height_points * 20),
+            )
+        ),
+    )
+    frame.set(
+        qn("w:x"),
+        str(
+            round(x0 * 20)
+        ),
+    )
+    frame.set(
+        qn("w:y"),
+        str(
+            round(max(0.0, y0 - 0.8) * 20)
+        ),
+    )
+    frame.set(
+        qn("w:hAnchor"),
+        "page",
+    )
+    frame.set(
+        qn("w:vAnchor"),
+        "page",
+    )
+    frame.set(
+        qn("w:wrap"),
+        "notBeside",
+    )
+    frame.set(
+        qn("w:hRule"),
+        "exact",
+    )
+    frame.set(
+        qn("w:xAlign"),
+        "left",
+    )
+    frame.set(
+        qn("w:yAlign"),
+        "top",
+    )
+    frame.set(
+        qn("w:anchorLock"),
+        "1",
+    )
+    p_pr.append(
+        frame
+    )
+
+    spacing = OxmlElement(
+        "w:spacing"
+    )
+    spacing.set(
+        qn("w:before"),
+        "0",
+    )
+    spacing.set(
+        qn("w:after"),
+        "0",
+    )
+    spacing.set(
+        qn("w:line"),
+        str(
+            max(
+                1,
+                round(height_points * 20)
+            )
+        ),
+    )
+    spacing.set(
+        qn("w:lineRule"),
+        "exact",
+    )
+    p_pr.append(
+        spacing
+    )
+
+    ind = OxmlElement(
+        "w:ind"
+    )
+    ind.set(
+        qn("w:left"),
+        "0",
+    )
+    ind.set(
+        qn("w:right"),
+        "0",
+    )
+    ind.set(
+        qn("w:firstLine"),
+        "0",
+    )
+    p_pr.append(
+        ind
+    )
+
+    # Prevent Word from trying to keep these absolute lines together and
+    # accidentally moving them to another page.
+    contextual = OxmlElement(
+        "w:contextualSpacing"
+    )
+    p_pr.append(
+        contextual
+    )
+
+    for span in spans:
+        span_text = str(
+            span.get("text", "")
         )
 
-        if not spans:
+        if not span_text:
             continue
 
-        line_text = "".join(
-            str(span.get("text", ""))
-            for span in spans
+        run = paragraph.add_run(
+            span_text
         )
 
-        if not line_text.strip():
-            continue
+        font = run.font
 
-        lx0, ly0, lx1, ly1 = (
-            float(value)
-            for value in line.get(
-                "bbox",
-                (x0, y0, x1, y1),
+        raw_font_name = str(
+            span.get(
+                "font",
+                "Arial",
+            )
+        )
+        font.name = _clean_pdf_font_name(
+            raw_font_name
+        )
+
+        font.size = Pt(
+            max(
+                5.0,
+                min(
+                    72.0,
+                    float(
+                        span.get(
+                            "size",
+                            10.0,
+                        )
+                    ),
+                ),
             )
         )
 
-        text_paragraph = OxmlElement(
-            "w:p"
-        )
-        paragraph_properties = OxmlElement(
-            "w:pPr"
-        )
-
-        # Preserve the line's horizontal placement inside the PDF block.
-        relative_left_points = max(
-            0.0,
-            lx0 - x0,
-        )
-
-        indent = OxmlElement(
-            "w:ind"
-        )
-        indent.set(
-            qn("w:left"),
-            str(
-                round(
-                    relative_left_points * 20
-                )
-            ),
-        )
-        paragraph_properties.append(
-            indent
-        )
-
-        # Preserve vertical gaps between PDF lines. The first line begins at
-        # the top of the fixed-position block; later lines use the PDF gap.
-        if line_index == 0:
-            gap_points = max(
-                0.0,
-                ly0 - y0,
+        font_name_lower = raw_font_name.lower()
+        flags = int(
+            span.get(
+                "flags",
+                0,
             )
-        else:
-            gap_points = max(
-                0.0,
-                ly0 - previous_line_bottom,
+        )
+
+        font.bold = bool(
+            "bold" in font_name_lower
+            or
+            flags & 16
+        )
+
+        font.italic = bool(
+            "italic" in font_name_lower
+            or
+            "oblique" in font_name_lower
+            or
+            flags & 2
+        )
+
+        color_hex = _pdf_color_hex(
+            span.get(
+                "color",
+                0,
             )
-
-        spacing = OxmlElement(
-            "w:spacing"
-        )
-        spacing.set(
-            qn("w:before"),
-            str(
-                round(
-                    gap_points * 20
-                )
-            ),
-        )
-        spacing.set(
-            qn("w:after"),
-            "0",
-        )
-        spacing.set(
-            qn("w:line"),
-            "200",
-        )
-        spacing.set(
-            qn("w:lineRule"),
-            "auto",
-        )
-        paragraph_properties.append(
-            spacing
         )
 
-        text_paragraph.append(
-            paragraph_properties
-        )
+        try:
+            font.color.rgb = RGBColor.from_string(
+                color_hex
+            )
+        except Exception:
+            pass
 
-        for span in spans:
-            _append_styled_pdf_span(
-                text_paragraph,
-                span,
+        # Preserve spaces exactly.
+        run_xml = run._r
+        for text_node in run_xml.findall(
+            qn("w:t")
+        ):
+            text_node.set(
+                f"{{{_XML_NS}}}space",
+                "preserve",
             )
 
-        textbox_content.append(
-            text_paragraph
-        )
-
-        previous_line_bottom = max(
-            previous_line_bottom,
-            ly1,
-        )
-
-    if len(textbox_content) == 0:
-        return
-
-    textbox.append(
-        textbox_content
-    )
-    shape.append(
-        textbox
-    )
-    picture.append(
-        shape
-    )
-    run.append(
-        picture
-    )
-    paragraph._p.append(
-        run
-    )
 
 
-def _page_editable_blocks(
-    page,
-) -> list[dict[str, Any]]:
-    """
-    Return PDF text blocks while retaining the original line/span structure.
-
-    The background redaction still happens at line level so graphics and table
-    borders remain protected. Only the Word object representation is grouped.
-    """
-    blocks: list[dict[str, Any]] = []
+def _page_editable_lines(page) -> list[tuple[Any, list[dict[str, Any]]]]:
+    """Return visible text lines and their styled PDF spans in page order."""
+    lines: list[tuple[Any, list[dict[str, Any]]]] = []
 
     page_data = page.get_text(
         "dict",
@@ -842,15 +722,8 @@ def _page_editable_blocks(
         "blocks",
         [],
     ):
-        if int(
-            block.get(
-                "type",
-                0,
-            )
-        ) != 0:
+        if int(block.get("type", 0)) != 0:
             continue
-
-        useful_lines: list[dict[str, Any]] = []
 
         for line in block.get(
             "lines",
@@ -867,65 +740,19 @@ def _page_editable_blocks(
                 continue
 
             line_text = "".join(
-                str(
-                    span.get(
-                        "text",
-                        "",
-                    )
-                )
+                str(span.get("text", ""))
                 for span in spans
             )
 
             if not line_text.strip():
                 continue
 
-            useful_lines.append(
-                line
-            )
-
-        if not useful_lines:
-            continue
-
-        blocks.append({
-            "bbox": block.get(
-                "bbox",
-                (0, 0, 0, 0),
-            ),
-            "lines": useful_lines,
-        })
-
-    return blocks
-
-
-def _page_redaction_lines(
-    blocks: list[dict[str, Any]],
-) -> list[tuple[Any, list[dict[str, Any]]]]:
-    """
-    Flatten block lines only for background text removal.
-
-    This does NOT create extra Word objects; it only ensures the visual layer
-    remains identical to the existing preserve-layout implementation.
-    """
-    lines: list[
-        tuple[
-            Any,
-            list[dict[str, Any]],
-        ]
-    ] = []
-
-    for block in blocks:
-        for line in block["lines"]:
             lines.append((
                 line.get(
                     "bbox",
                     (0, 0, 0, 0),
                 ),
-                list(
-                    line.get(
-                        "spans",
-                        [],
-                    )
-                ),
+                spans,
             ))
 
     return lines
@@ -937,10 +764,10 @@ def _render_non_text_page_layer(
     lines: list[tuple[Any, list[dict[str, Any]]]],
 ) -> bytes:
     """
-    Render one PDF page after removing text.
+    Render one PDF page after removing its text objects.
 
-    IMPORTANT: the original 1.30 render scale and JPEG quality 84 are retained.
-    This fast-open optimization does not lower background fidelity.
+    Redactions use fill=None and leave images / vector graphics untouched, so
+    the page's design survives while the editable Word text can sit on top.
     """
     visual_document = fitz.open()
     visual_document.insert_pdf(
@@ -956,6 +783,8 @@ def _render_non_text_page_layer(
             bbox
         )
 
+        # A tiny expansion catches anti-aliased glyph edges without erasing
+        # nearby table borders or design elements.
         rectangle.x0 -= 0.25
         rectangle.y0 -= 0.20
         rectangle.x1 += 0.25
@@ -997,19 +826,14 @@ def _preserve_layout_pdf_to_docx(
     output_path: Path,
 ) -> None:
     """
-    Preserve-layout PDF -> DOCX with a faster Word-open representation.
+    Preserve-layout PDF -> DOCX conversion.
 
-    The visual output is unchanged in principle:
-      - one PDF page = one Word page
-      - same 1.30x / JPEG-84 non-text background layer
-      - same editable PDF text
-      - same span-level font sizes, colors, bold and italic formatting
-      - same page dimensions
-
-    The performance improvement comes from representing each PDF text block as
-    ONE Word textbox rather than representing every individual line as its own
-    top-level Word shape. Large designed PDFs therefore contain far fewer Word
-    drawing objects for Word to parse while opening.
+    Each PDF page becomes exactly one Word page.
+    - Non-text visuals stay as the same high-quality fixed background layer.
+    - Every PDF text line is placed at its original page coordinates.
+    - Text remains editable.
+    - Native Word paragraph frames replace the old VML text boxes, which
+      greatly reduces document-open overhead without grouping lines together.
     """
     source = fitz.open(
         input_path
@@ -1022,6 +846,14 @@ def _preserve_layout_pdf_to_docx(
             )
 
         document = Document()
+
+        # Remove the default body paragraph so it cannot introduce visible
+        # layout drift on the first page.
+        if document.paragraphs:
+            default_paragraph = document.paragraphs[0]
+            default_paragraph._element.getparent().remove(
+                default_paragraph._element
+            )
 
         first_page = source[0]
         first_section = document.sections[0]
@@ -1038,8 +870,6 @@ def _preserve_layout_pdf_to_docx(
         first_section.header_distance = Pt(0)
         first_section.footer_distance = Pt(0)
 
-        shape_index = 1
-
         for page_index, page in enumerate(source):
             section = document.sections[-1]
             section.page_width = Pt(
@@ -1055,27 +885,24 @@ def _preserve_layout_pdf_to_docx(
             section.header_distance = Pt(0)
             section.footer_distance = Pt(0)
 
-            editable_blocks = _page_editable_blocks(
+            editable_lines = _page_editable_lines(
                 page
-            )
-
-            redaction_lines = _page_redaction_lines(
-                editable_blocks
             )
 
             background_bytes = _render_non_text_page_layer(
                 source,
                 page_index,
-                redaction_lines,
+                editable_lines,
             )
 
-            page_paragraph = document.add_paragraph()
-            page_paragraph.paragraph_format.space_before = Pt(0)
-            page_paragraph.paragraph_format.space_after = Pt(0)
-            page_paragraph.paragraph_format.line_spacing = Pt(1)
+            # One lightweight paragraph owns the full-page visual background.
+            background_paragraph = document.add_paragraph()
+            background_paragraph.paragraph_format.space_before = Pt(0)
+            background_paragraph.paragraph_format.space_after = Pt(0)
+            background_paragraph.paragraph_format.line_spacing = Pt(1)
 
             _add_fixed_page_background(
-                page_paragraph,
+                background_paragraph,
                 document,
                 background_bytes,
                 page_index,
@@ -1083,31 +910,27 @@ def _preserve_layout_pdf_to_docx(
                 page.rect.height,
             )
 
-            for block in editable_blocks:
-                _add_fixed_text_block(
-                    page_paragraph,
-                    block["bbox"],
-                    block["lines"],
-                    shape_index,
+            # Keep every PDF line independent so Word cannot reflow a whole
+            # block and destroy columns, bullets, sidebars, or table content.
+            for bbox, spans in editable_lines:
+                _add_fixed_text_line(
+                    document,
+                    bbox,
+                    spans,
                 )
-                shape_index += 1
 
             if page_index < len(source) - 1:
-                page_break_run = OxmlElement(
-                    "w:r"
-                )
-                page_break = OxmlElement(
-                    "w:br"
-                )
-                page_break.set(
+                page_break_paragraph = document.add_paragraph()
+                page_break_paragraph.paragraph_format.space_before = Pt(0)
+                page_break_paragraph.paragraph_format.space_after = Pt(0)
+
+                run = page_break_paragraph.add_run()
+                run.add_break()
+
+                break_node = run._r[-1]
+                break_node.set(
                     qn("w:type"),
                     "page",
-                )
-                page_break_run.append(
-                    page_break
-                )
-                page_paragraph._p.append(
-                    page_break_run
                 )
 
         document.save(
