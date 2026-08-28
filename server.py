@@ -279,35 +279,69 @@ def pdf_to_txt(input_path: Path, output_path: Path) -> None:
     output_path.write_text("\n\n".join(parts), encoding="utf-8")
 
 
-def pdf_to_docx(input_path: Path, output_path: Path) -> None:
+def pdf_to_docx(
+    input_path: Path,
+    output_path: Path,
+) -> None:
     """
-    Reconstruct a PDF as an editable Word document.
+    Convert PDF -> editable DOCX with layout reconstruction.
 
-    pdf2docx reads PDF geometry, text spans, images, tables, and page
-    structure, then rebuilds them as Word elements. This gives much
-    better editability and layout preservation than simply extracting
-    text into paragraphs.
-
-    Note: PDF and DOCX use fundamentally different layout models, so no
-    converter can guarantee pixel-perfect results for every complex PDF.
+    For larger PDFs, pdf2docx multiprocessing is enabled so separate
+    page ranges can be parsed in parallel. Small PDFs stay single-process
+    because process startup/merge overhead can make them slower.
     """
 
     converter = None
 
     try:
-        # Fail clearly for PDFs with no pages instead of producing a
-        # misleading empty Word document.
         with fitz.open(input_path) as source_pdf:
-            if len(source_pdf) == 0:
-                raise RuntimeError("The PDF contains no pages.")
+            page_count = len(source_pdf)
+
+        if page_count == 0:
+            raise RuntimeError(
+                "The PDF contains no pages."
+            )
 
         converter = PDFToDOCXConverter(
             str(input_path)
         )
 
-        converter.convert(
-            str(output_path)
+        # Railway may expose more logical CPUs than are actually useful.
+        # Cap at 4 workers to avoid excessive RAM/process overhead.
+        detected_cpus = (
+            os.cpu_count()
+            or
+            1
         )
+
+        worker_count = max(
+            1,
+            min(
+                4,
+                detected_cpus,
+                page_count,
+            ),
+        )
+
+        # Multiprocessing becomes worthwhile mainly on multi-page PDFs.
+        use_multiprocessing = (
+            page_count >= 8
+            and
+            worker_count >= 2
+        )
+
+        if use_multiprocessing:
+            converter.convert(
+                str(output_path),
+                start=0,
+                end=page_count,
+                multi_processing=True,
+                cpu_count=worker_count,
+            )
+        else:
+            converter.convert(
+                str(output_path)
+            )
 
     except RuntimeError:
         raise
