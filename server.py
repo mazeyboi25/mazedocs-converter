@@ -19,6 +19,8 @@ import fitz
 import markdown
 from bs4 import BeautifulSoup
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,7 @@ from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
+from lxml import etree
 from PIL import Image
 from pdf2docx import Converter as PDFToDOCXConverter
 from pillow_heif import register_heif_opener
@@ -68,7 +71,7 @@ app.add_middleware(
 
 ROUTES: dict[str, list[dict[str, Any]]] = {
     "pdf": [
-        {"target": "docx", "description": "Editable Word document reconstructed from the PDF with text, images, tables, and layout preserved as closely as possible."},
+        {"target": "docx", "description": "Preserve-layout Word document: keeps each PDF page visually intact while rebuilding its text as editable positioned Word text."},
         {"target": "pptx", "description": "One visually faithful PDF page per PowerPoint slide."},
         {"target": "txt", "description": "Plain text extracted from every PDF page."},
         {"target": "png", "description": "PNG page images packaged as a ZIP file."},
@@ -280,395 +283,688 @@ def pdf_to_txt(input_path: Path, output_path: Path) -> None:
 
 
 def _clean_pdf_font_name(name: str) -> str:
-    """Remove common PDF subset prefixes from embedded font names."""
+    """Turn common embedded-PDF font names into Word-friendly family names."""
     value = str(name or "").strip()
 
-    if "+" in value:
-        value = value.split("+", 1)[1]
+    # Remove PDF subset prefixes such as ABCDEF+Poppins-Regular.
+    value = re.sub(
+        r"^[A-Z]{6}\+",
+        "",
+        value,
+    )
+
+    replacements = {
+        "ArialMT": "Arial",
+        "Arial-BoldMT": "Arial",
+        "Arial-ItalicMT": "Arial",
+        "Arial-BoldItalicMT": "Arial",
+        "TimesNewRomanPSMT": "Times New Roman",
+        "TimesNewRomanPS-BoldMT": "Times New Roman",
+        "TimesNewRomanPS-ItalicMT": "Times New Roman",
+        "TimesNewRomanPS-BoldItalicMT": "Times New Roman",
+        "Calibri-Regular": "Calibri",
+        "Calibri-Bold": "Calibri",
+        "Calibri-Italic": "Calibri",
+        "Calibri-BoldItalic": "Calibri",
+        "Poppins-Regular": "Poppins",
+        "Poppins-Bold": "Poppins",
+        "Poppins-Italic": "Poppins",
+        "Poppins-BoldItalic": "Poppins",
+        "Georgia-Bold": "Georgia",
+        "Georgia-Italic": "Georgia",
+        "Georgia-BoldItalic": "Georgia",
+    }
+
+    if value in replacements:
+        return replacements[value]
+
+    # Strip style suffixes while leaving the family name intact.
+    for suffix in (
+        "-BoldItalic",
+        "-BoldOblique",
+        "-SemiboldItalic",
+        "-SemiBoldItalic",
+        "-Semibold",
+        "-SemiBold",
+        "-Bold",
+        "-Italic",
+        "-Oblique",
+    ):
+        if value.endswith(suffix):
+            value = value[:-len(suffix)]
+            break
+
+    if value.endswith("MT") and len(value) > 2:
+        value = value[:-2]
 
     return value or "Arial"
 
 
-def _rgb_from_pdf_color(value: int) -> RGBColor:
-    """Convert PyMuPDF's integer RGB color into python-docx RGBColor."""
-    value = int(value or 0)
+def _pdf_color_hex(value: int) -> str:
+    """Convert PyMuPDF's packed RGB integer to Word's RRGGBB value."""
+    color = int(value or 0)
 
-    return RGBColor(
-        (value >> 16) & 255,
-        (value >> 8) & 255,
-        value & 255,
+    return (
+        f"{(color >> 16) & 255:02X}"
+        f"{(color >> 8) & 255:02X}"
+        f"{color & 255:02X}"
     )
 
 
-def _bbox_inside_table(
-    bbox: tuple[float, float, float, float],
-    table_boxes: list[tuple[float, float, float, float]],
-) -> bool:
-    """Avoid duplicating text that is later recreated as a Word table."""
-    x0, y0, x1, y1 = bbox
-    center_x = (x0 + x1) / 2
-    center_y = (y0 + y1) / 2
-
-    for tx0, ty0, tx1, ty1 in table_boxes:
-        if (
-            tx0 <= center_x <= tx1
-            and
-            ty0 <= center_y <= ty1
-        ):
-            return True
-
-    return False
+_VML_NS = "urn:schemas-microsoft-com:vml"
+_OFFICE_NS = "urn:schemas-microsoft-com:office:office"
+_WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_XML_NS = "http://www.w3.org/XML/1998/namespace"
 
 
-def _add_pdf_image_to_docx(
+def _vml_element(
+    namespace: str,
+    tag: str,
+    attributes: dict[str, Any] | None = None,
+):
+    element = etree.Element(
+        f"{{{namespace}}}{tag}"
+    )
+
+    prefix_to_namespace = {
+        "w": _WORD_NS,
+        "r": _REL_NS,
+        "v": _VML_NS,
+        "o": _OFFICE_NS,
+    }
+
+    for key, value in (attributes or {}).items():
+        if ":" in key:
+            prefix, local_name = key.split(
+                ":",
+                1,
+            )
+            attribute_namespace = prefix_to_namespace[prefix]
+            element.set(
+                f"{{{attribute_namespace}}}{local_name}",
+                str(value),
+            )
+        else:
+            element.set(
+                key,
+                str(value),
+            )
+
+    return element
+
+
+def _add_fixed_page_background(
     paragraph,
+    document: Document,
     image_bytes: bytes,
-    width_points: float,
+    page_index: int,
+    page_width: float,
+    page_height: float,
 ) -> None:
-    """Insert a PDF image block, converting unusual formats to PNG if needed."""
-    if not image_bytes:
-        return
+    """
+    Add the PDF page's non-text visual layer behind the editable Word text.
 
-    width_points = max(
-        24.0,
-        min(
-            520.0,
-            float(width_points or 220.0),
-        ),
+    The background contains the original images, borders, diagrams, table
+    lines, colors, watermarks, and other graphics. PDF text is removed before
+    this image is rendered so edits do not expose duplicate text underneath.
+    """
+    relationship_id, _ = document.part.get_or_add_image(
+        io.BytesIO(image_bytes)
     )
 
-    try:
-        paragraph.add_run().add_picture(
-            io.BytesIO(image_bytes),
-            width=Pt(width_points),
+    run = OxmlElement("w:r")
+    picture = OxmlElement("w:pict")
+
+    shape = _vml_element(
+        _VML_NS,
+        "rect",
+        {
+            "id": f"MazeDocsPageBackground{page_index + 1}",
+            "stroked": "f",
+            "filled": "t",
+            "style": (
+                "position:absolute;"
+                "margin-left:0pt;"
+                "margin-top:0pt;"
+                f"width:{page_width:.3f}pt;"
+                f"height:{page_height:.3f}pt;"
+                "z-index:-251654144;"
+                "mso-position-horizontal-relative:page;"
+                "mso-position-vertical-relative:page;"
+                "mso-wrap-distance-left:0;"
+                "mso-wrap-distance-right:0;"
+                "mso-wrap-distance-top:0;"
+                "mso-wrap-distance-bottom:0;"
+            ),
+        },
+    )
+
+    image_data = _vml_element(
+        _VML_NS,
+        "imagedata",
+        {
+            "r:id": relationship_id,
+            "o:title": "",
+        },
+    )
+
+    shape.append(image_data)
+    picture.append(shape)
+    run.append(picture)
+    paragraph._p.append(run)
+
+
+def _add_fixed_text_line(
+    paragraph,
+    line_bbox,
+    spans: list[dict[str, Any]],
+    shape_index: int,
+) -> None:
+    """
+    Recreate one PDF text line as a fixed-position editable Word text box.
+
+    A line can still contain several Word runs, so mixed bold/italic/color
+    formatting from the PDF is retained without allowing Word to reflow the
+    entire PDF into hundreds of pages.
+    """
+    if not spans:
+        return
+
+    text_value = "".join(
+        str(span.get("text", ""))
+        for span in spans
+    )
+
+    if not text_value.strip():
+        return
+
+    x0, y0, x1, y1 = (
+        float(value)
+        for value in line_bbox
+    )
+
+    # Word and PDF font metrics are never perfectly identical. A small amount
+    # of extra width prevents the last glyph from wrapping or being clipped.
+    width = max(
+        8.0,
+        (x1 - x0) * 1.16 + 5.0,
+    )
+    height = max(
+        8.0,
+        (y1 - y0) * 1.45 + 3.0,
+    )
+
+    run = OxmlElement("w:r")
+    picture = OxmlElement("w:pict")
+
+    shape = _vml_element(
+        _VML_NS,
+        "shape",
+        {
+            "id": f"MazeDocsEditableText{shape_index}",
+            "filled": "f",
+            "stroked": "f",
+            "style": (
+                "position:absolute;"
+                f"margin-left:{x0:.3f}pt;"
+                f"margin-top:{max(0.0, y0 - 1.4):.3f}pt;"
+                f"width:{width:.3f}pt;"
+                f"height:{height:.3f}pt;"
+                "z-index:10;"
+                "mso-position-horizontal-relative:page;"
+                "mso-position-vertical-relative:page;"
+                "mso-fit-shape-to-text:t;"
+            ),
+        },
+    )
+
+    textbox = _vml_element(
+        _VML_NS,
+        "textbox",
+        {
+            "inset": "0,0,0,0",
+        },
+    )
+
+    textbox_content = OxmlElement(
+        "w:txbxContent"
+    )
+
+    text_paragraph = OxmlElement(
+        "w:p"
+    )
+
+    paragraph_properties = OxmlElement(
+        "w:pPr"
+    )
+
+    spacing = OxmlElement(
+        "w:spacing"
+    )
+    spacing.set(
+        qn("w:before"),
+        "0",
+    )
+    spacing.set(
+        qn("w:after"),
+        "0",
+    )
+    spacing.set(
+        qn("w:line"),
+        "200",
+    )
+    spacing.set(
+        qn("w:lineRule"),
+        "auto",
+    )
+
+    paragraph_properties.append(
+        spacing
+    )
+    text_paragraph.append(
+        paragraph_properties
+    )
+
+    for span in spans:
+        span_text = str(
+            span.get("text", "")
         )
-        return
-    except Exception:
-        pass
 
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            converted = io.BytesIO()
+        if not span_text:
+            continue
 
-            if image.mode not in {"RGB", "RGBA"}:
-                image = image.convert("RGB")
+        text_run = OxmlElement(
+            "w:r"
+        )
+        run_properties = OxmlElement(
+            "w:rPr"
+        )
 
-            image.save(
-                converted,
-                format="PNG",
+        raw_font_name = str(
+            span.get(
+                "font",
+                "Arial",
             )
-            converted.seek(0)
+        )
+        font_name = _clean_pdf_font_name(
+            raw_font_name
+        )
 
-            paragraph.add_run().add_picture(
-                converted,
-                width=Pt(width_points),
+        fonts = OxmlElement(
+            "w:rFonts"
+        )
+        fonts.set(
+            qn("w:ascii"),
+            font_name,
+        )
+        fonts.set(
+            qn("w:hAnsi"),
+            font_name,
+        )
+        fonts.set(
+            qn("w:eastAsia"),
+            font_name,
+        )
+        run_properties.append(
+            fonts
+        )
+
+        font_size = max(
+            5.0,
+            min(
+                72.0,
+                float(
+                    span.get(
+                        "size",
+                        10.0,
+                    )
+                ),
+            ),
+        )
+
+        half_points = str(
+            max(
+                10,
+                round(font_size * 2),
             )
-    except Exception:
-        # A malformed image should not cause the entire PDF -> Word job to fail.
-        return
+        )
+
+        size = OxmlElement(
+            "w:sz"
+        )
+        size.set(
+            qn("w:val"),
+            half_points,
+        )
+        run_properties.append(
+            size
+        )
+
+        complex_size = OxmlElement(
+            "w:szCs"
+        )
+        complex_size.set(
+            qn("w:val"),
+            half_points,
+        )
+        run_properties.append(
+            complex_size
+        )
+
+        font_name_lower = raw_font_name.lower()
+        flags = int(
+            span.get(
+                "flags",
+                0,
+            )
+        )
+
+        if (
+            "bold" in font_name_lower
+            or
+            flags & 16
+        ):
+            run_properties.append(
+                OxmlElement("w:b")
+            )
+
+        if (
+            "italic" in font_name_lower
+            or
+            "oblique" in font_name_lower
+            or
+            flags & 2
+        ):
+            run_properties.append(
+                OxmlElement("w:i")
+            )
+
+        color = OxmlElement(
+            "w:color"
+        )
+        color.set(
+            qn("w:val"),
+            _pdf_color_hex(
+                span.get(
+                    "color",
+                    0,
+                )
+            ),
+        )
+        run_properties.append(
+            color
+        )
+
+        text_run.append(
+            run_properties
+        )
+
+        text_node = OxmlElement(
+            "w:t"
+        )
+        text_node.set(
+            f"{{{_XML_NS}}}space",
+            "preserve",
+        )
+        text_node.text = span_text
+        text_run.append(
+            text_node
+        )
+        text_paragraph.append(
+            text_run
+        )
+
+    textbox_content.append(
+        text_paragraph
+    )
+    textbox.append(
+        textbox_content
+    )
+    shape.append(
+        textbox
+    )
+    picture.append(
+        shape
+    )
+    run.append(
+        picture
+    )
+    paragraph._p.append(
+        run
+    )
 
 
-def _fast_pdf_to_docx(
+def _page_editable_lines(page) -> list[tuple[Any, list[dict[str, Any]]]]:
+    """Return visible text lines and their styled PDF spans in page order."""
+    lines: list[tuple[Any, list[dict[str, Any]]]] = []
+
+    page_data = page.get_text(
+        "dict",
+        sort=True,
+    )
+
+    for block in page_data.get(
+        "blocks",
+        [],
+    ):
+        if int(block.get("type", 0)) != 0:
+            continue
+
+        for line in block.get(
+            "lines",
+            [],
+        ):
+            spans = list(
+                line.get(
+                    "spans",
+                    [],
+                )
+            )
+
+            if not spans:
+                continue
+
+            line_text = "".join(
+                str(span.get("text", ""))
+                for span in spans
+            )
+
+            if not line_text.strip():
+                continue
+
+            lines.append((
+                line.get(
+                    "bbox",
+                    (0, 0, 0, 0),
+                ),
+                spans,
+            ))
+
+    return lines
+
+
+def _render_non_text_page_layer(
+    source_document,
+    page_index: int,
+    lines: list[tuple[Any, list[dict[str, Any]]]],
+) -> bytes:
+    """
+    Render one PDF page after removing its text objects.
+
+    Redactions use fill=None and leave images / vector graphics untouched, so
+    the page's design survives while the editable Word text can sit on top.
+    """
+    visual_document = fitz.open()
+    visual_document.insert_pdf(
+        source_document,
+        from_page=page_index,
+        to_page=page_index,
+    )
+
+    visual_page = visual_document[0]
+
+    for bbox, _ in lines:
+        rectangle = fitz.Rect(
+            bbox
+        )
+
+        # A tiny expansion catches anti-aliased glyph edges without erasing
+        # nearby table borders or design elements.
+        rectangle.x0 -= 0.25
+        rectangle.y0 -= 0.20
+        rectangle.x1 += 0.25
+        rectangle.y1 += 0.20
+
+        visual_page.add_redact_annot(
+            rectangle,
+            fill=None,
+            cross_out=False,
+        )
+
+    if lines:
+        visual_page.apply_redactions(
+            images=0,
+            graphics=0,
+            text=0,
+        )
+
+    pixmap = visual_page.get_pixmap(
+        matrix=fitz.Matrix(
+            1.30,
+            1.30,
+        ),
+        alpha=False,
+    )
+
+    image_bytes = pixmap.tobytes(
+        "jpeg",
+        jpg_quality=84,
+    )
+
+    visual_document.close()
+
+    return image_bytes
+
+
+def _preserve_layout_pdf_to_docx(
     input_path: Path,
     output_path: Path,
 ) -> None:
     """
-    Fast editable PDF -> DOCX reconstruction.
+    Preserve-layout PDF -> DOCX conversion.
 
-    This path intentionally avoids pdf2docx's expensive page-layout heuristics.
-    It rebuilds the document directly from PyMuPDF text spans, detected tables,
-    and embedded image blocks. Text remains editable, common font styling and
-    colors are retained, tables are recreated, and the original page dimensions
-    are used for the Word document.
+    Each PDF page becomes exactly one Word page. The page's non-text visuals
+    are kept as a fixed background layer and every PDF text line is rebuilt as
+    editable, fixed-position Word text. This prevents Word from reflowing an
+    89-page designed PDF into several hundred pages.
     """
-    source = fitz.open(input_path)
-
-    if len(source) == 0:
-        source.close()
-        raise RuntimeError(
-            "The PDF contains no pages."
-        )
-
-    document = Document()
-
-    # Remove the default blank paragraph's spacing so page positioning starts
-    # closer to the PDF's original top edge.
-    if document.paragraphs:
-        default_paragraph = document.paragraphs[0]
-        default_paragraph.paragraph_format.space_after = Pt(0)
-        default_paragraph.paragraph_format.space_before = Pt(0)
-
-    for page_index, page in enumerate(source):
-        page_rect = page.rect
-
-        section = document.sections[-1]
-        section.page_width = Pt(page_rect.width)
-        section.page_height = Pt(page_rect.height)
-
-        # Small margins leave room for Word's layout engine while still
-        # preserving most of the PDF's usable page area.
-        margin = 18.0
-        section.left_margin = Pt(margin)
-        section.right_margin = Pt(margin)
-        section.top_margin = Pt(margin)
-        section.bottom_margin = Pt(margin)
-
-        table_items: list[dict[str, Any]] = []
-        table_boxes: list[tuple[float, float, float, float]] = []
-
-        # PyMuPDF's native table finder is dramatically cheaper than full
-        # pdf2docx reconstruction and gives us genuinely editable Word tables.
-        try:
-            finder = page.find_tables()
-
-            for table in finder.tables:
-                bbox = tuple(float(v) for v in table.bbox)
-                rows = table.extract()
-
-                if not rows:
-                    continue
-
-                table_boxes.append(bbox)
-                table_items.append({
-                    "kind": "table",
-                    "bbox": bbox,
-                    "rows": rows,
-                })
-        except Exception:
-            # Table detection is best-effort. Text extraction still proceeds.
-            table_items = []
-            table_boxes = []
-
-        page_dict = page.get_text(
-            "dict",
-            sort=True,
-        )
-
-        content_items: list[dict[str, Any]] = []
-
-        for block in page_dict.get("blocks", []):
-            bbox = tuple(
-                float(v)
-                for v in block.get(
-                    "bbox",
-                    (0, 0, 0, 0),
-                )
-            )
-
-            block_type = int(
-                block.get("type", 0)
-            )
-
-            if (
-                block_type == 0
-                and
-                _bbox_inside_table(
-                    bbox,
-                    table_boxes,
-                )
-            ):
-                continue
-
-            if block_type == 0:
-                content_items.append({
-                    "kind": "text",
-                    "bbox": bbox,
-                    "block": block,
-                })
-
-            elif block_type == 1:
-                content_items.append({
-                    "kind": "image",
-                    "bbox": bbox,
-                    "image": block.get("image", b""),
-                })
-
-        content_items.extend(
-            table_items
-        )
-
-        content_items.sort(
-            key=lambda item: (
-                item["bbox"][1],
-                item["bbox"][0],
-            )
-        )
-
-        previous_bottom = margin
-
-        for item in content_items:
-            x0, y0, x1, y1 = item["bbox"]
-            vertical_gap = max(
-                0.0,
-                y0 - previous_bottom,
-            )
-
-            if item["kind"] == "text":
-                paragraph = document.add_paragraph()
-                formatting = paragraph.paragraph_format
-
-                formatting.space_before = Pt(
-                    min(
-                        36.0,
-                        vertical_gap,
-                    )
-                )
-                formatting.space_after = Pt(0)
-                formatting.left_indent = Pt(
-                    max(
-                        0.0,
-                        x0 - margin,
-                    )
-                )
-                formatting.right_indent = Pt(
-                    max(
-                        0.0,
-                        page_rect.width - x1 - margin,
-                    )
-                )
-                formatting.line_spacing = 1.0
-
-                lines = item["block"].get(
-                    "lines",
-                    [],
-                )
-
-                for line_index, line in enumerate(lines):
-                    spans = line.get(
-                        "spans",
-                        [],
-                    )
-
-                    for span in spans:
-                        text = str(
-                            span.get("text", "")
-                        )
-
-                        if not text:
-                            continue
-
-                        run = paragraph.add_run(
-                            text
-                        )
-
-                        font = run.font
-                        font.name = _clean_pdf_font_name(
-                            span.get("font", "Arial")
-                        )
-
-                        font.size = Pt(
-                            max(
-                                5.0,
-                                min(
-                                    72.0,
-                                    float(
-                                        span.get("size", 11.0)
-                                    ),
-                                ),
-                            )
-                        )
-
-                        flags = int(
-                            span.get("flags", 0)
-                        )
-                        font.bold = bool(
-                            flags & 16
-                        )
-                        font.italic = bool(
-                            flags & 2
-                        )
-
-                        try:
-                            font.color.rgb = _rgb_from_pdf_color(
-                                span.get("color", 0)
-                            )
-                        except Exception:
-                            pass
-
-                    if line_index < len(lines) - 1:
-                        paragraph.add_run().add_break()
-
-            elif item["kind"] == "table":
-                rows = item["rows"]
-                column_count = max(
-                    (
-                        len(row or [])
-                        for row in rows
-                    ),
-                    default=0,
-                )
-
-                if column_count:
-                    spacer = document.add_paragraph()
-                    spacer.paragraph_format.space_before = Pt(
-                        min(
-                            24.0,
-                            vertical_gap,
-                        )
-                    )
-                    spacer.paragraph_format.space_after = Pt(0)
-
-                    word_table = document.add_table(
-                        rows=len(rows),
-                        cols=column_count,
-                    )
-                    word_table.style = "Table Grid"
-
-                    for row_index, row in enumerate(rows):
-                        row = row or []
-
-                        for column_index in range(column_count):
-                            value = (
-                                row[column_index]
-                                if column_index < len(row)
-                                else ""
-                            )
-
-                            word_table.cell(
-                                row_index,
-                                column_index,
-                            ).text = str(
-                                value or ""
-                            )
-
-            elif item["kind"] == "image":
-                paragraph = document.add_paragraph()
-                paragraph.paragraph_format.space_before = Pt(
-                    min(
-                        24.0,
-                        vertical_gap,
-                    )
-                )
-                paragraph.paragraph_format.space_after = Pt(0)
-                paragraph.paragraph_format.left_indent = Pt(
-                    max(
-                        0.0,
-                        x0 - margin,
-                    )
-                )
-
-                _add_pdf_image_to_docx(
-                    paragraph,
-                    item.get("image", b""),
-                    max(
-                        24.0,
-                        x1 - x0,
-                    ),
-                )
-
-            previous_bottom = max(
-                previous_bottom,
-                y1,
-            )
-
-        if page_index < len(source) - 1:
-            document.add_page_break()
-
-    source.close()
-
-    document.save(
-        output_path
+    source = fitz.open(
+        input_path
     )
+
+    try:
+        if len(source) == 0:
+            raise RuntimeError(
+                "The PDF contains no pages."
+            )
+
+        document = Document()
+
+        # Absolute-positioned objects use page coordinates. Zero margins make
+        # those PDF coordinates map directly onto the Word page.
+        first_page = source[0]
+        first_section = document.sections[0]
+        first_section.page_width = Pt(
+            first_page.rect.width
+        )
+        first_section.page_height = Pt(
+            first_page.rect.height
+        )
+        first_section.left_margin = Pt(0)
+        first_section.right_margin = Pt(0)
+        first_section.top_margin = Pt(0)
+        first_section.bottom_margin = Pt(0)
+        first_section.header_distance = Pt(0)
+        first_section.footer_distance = Pt(0)
+
+        shape_index = 1
+
+        for page_index, page in enumerate(source):
+            # Most PDFs use one page size throughout. Keep setting these values
+            # so the common case stays exact; mixed-size PDFs use the current
+            # section size of their latest page.
+            section = document.sections[-1]
+            section.page_width = Pt(
+                page.rect.width
+            )
+            section.page_height = Pt(
+                page.rect.height
+            )
+            section.left_margin = Pt(0)
+            section.right_margin = Pt(0)
+            section.top_margin = Pt(0)
+            section.bottom_margin = Pt(0)
+            section.header_distance = Pt(0)
+            section.footer_distance = Pt(0)
+
+            editable_lines = _page_editable_lines(
+                page
+            )
+
+            background_bytes = _render_non_text_page_layer(
+                source,
+                page_index,
+                editable_lines,
+            )
+
+            page_paragraph = document.add_paragraph()
+            page_paragraph.paragraph_format.space_before = Pt(0)
+            page_paragraph.paragraph_format.space_after = Pt(0)
+            page_paragraph.paragraph_format.line_spacing = Pt(1)
+
+            _add_fixed_page_background(
+                page_paragraph,
+                document,
+                background_bytes,
+                page_index,
+                page.rect.width,
+                page.rect.height,
+            )
+
+            for bbox, spans in editable_lines:
+                _add_fixed_text_line(
+                    page_paragraph,
+                    bbox,
+                    spans,
+                    shape_index,
+                )
+                shape_index += 1
+
+            if page_index < len(source) - 1:
+                page_break_run = OxmlElement(
+                    "w:r"
+                )
+                page_break = OxmlElement(
+                    "w:br"
+                )
+                page_break.set(
+                    qn("w:type"),
+                    "page",
+                )
+                page_break_run.append(
+                    page_break
+                )
+                page_paragraph._p.append(
+                    page_break_run
+                )
+
+        document.save(
+            output_path
+        )
+
+    finally:
+        source.close()
 
 
 def pdf_to_docx(
@@ -676,51 +972,24 @@ def pdf_to_docx(
     output_path: Path,
 ) -> None:
     """
-    MazeDocs fast PDF -> Word route.
+    MazeDocs PDF -> Word preserve-layout route.
 
-    Large/normal documents use the direct PyMuPDF reconstruction path so a
-    conversion does not spend several minutes inside pdf2docx heuristics.
-    Tiny PDFs can still use pdf2docx for maximum layout fidelity because the
-    overhead is usually acceptable there.
+    This route favors one-to-one page fidelity and editable positioned text
+    instead of normal Word reflow. It is intended for reviewers, handouts,
+    forms, certificates, designed notes, and other PDFs whose original layout
+    matters.
     """
-    with fitz.open(input_path) as source_pdf:
-        page_count = len(source_pdf)
-
-    if page_count == 0:
-        raise RuntimeError(
-            "The PDF contains no pages."
-        )
-
-    # Keep high-fidelity pdf2docx only for very small documents where it is
-    # unlikely to create the multi-minute conversion problem seen in production.
-    if page_count <= 3:
-        converter = None
-
-        try:
-            converter = PDFToDOCXConverter(
-                str(input_path)
-            )
-            converter.convert(
-                str(output_path)
-            )
-        except Exception as error:
-            # If pdf2docx has trouble with the PDF, immediately fall back to
-            # the fast reconstruction rather than leaving the job stuck.
-            _fast_pdf_to_docx(
-                input_path,
-                output_path,
-            )
-        finally:
-            if converter is not None:
-                try:
-                    converter.close()
-                except Exception:
-                    pass
-    else:
-        _fast_pdf_to_docx(
+    try:
+        _preserve_layout_pdf_to_docx(
             input_path,
             output_path,
         )
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(
+            f"PDF to Word conversion failed: {error}"
+        ) from error
 
     if (
         not output_path.exists()
