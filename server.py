@@ -948,6 +948,8 @@ def health_payload() -> dict[str, Any]:
         "libreoffice_available": bool(executable),
         "libreoffice_path": executable,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "conversion_mode": "background-jobs",
+        "job_api": True,
         "supported_inputs": sorted(ROUTES.keys()),
     }
 
