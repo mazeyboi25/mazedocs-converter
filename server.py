@@ -2140,12 +2140,3 @@ def conversion_job_download(
         },
         background=cleanup,
     )
-
-@app.get("/")
-def service_root() -> dict[str, Any]:
-    return {
-        "ok": True,
-        "service": "MazeDocs Converter API",
-        "health": "/api",
-        "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
-    }
