@@ -65,7 +65,6 @@ app.add_middleware(
         "http://127.0.0.1:8000",
         "http://localhost:8000",
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -1581,23 +1580,6 @@ def convert_file(input_path: Path, source: str, target: str, workdir: Path) -> P
         return output_path
 
     raise RuntimeError("This conversion route is not implemented.")
-
-
-def health_payload() -> dict[str, Any]:
-    executable = find_libreoffice()
-
-    return {
-        "ok": True,
-        "service": "MazeDocs V2",
-        "engine": "python-converter",
-        "libreoffice_available": bool(executable),
-        "libreoffice_path": executable,
-        "max_upload_bytes": MAX_UPLOAD_BYTES,
-        "conversion_mode": "background-jobs",
-        "job_api": True,
-        "supported_inputs": sorted(ROUTES.keys()),
-    }
-
 
 # ============================================================
 # BACKGROUND CONVERSION JOBS
