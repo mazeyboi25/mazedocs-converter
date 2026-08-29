@@ -51,6 +51,9 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 app = FastAPI(
     title="MazeDocs V2 API",
     description="Student-focused document conversion API.",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 app.add_middleware(
@@ -2137,32 +2140,6 @@ def conversion_job_download(
         },
         background=cleanup,
     )
-
-
-@app.get("/api")
-def health() -> dict[str, Any]:
-    """
-    Stable Vercel entrypoint used by the frontend health check.
-    """
-    return health_payload()
-
-
-@app.post("/api")
-async def convert_from_root_api(
-    file: UploadFile = File(...),
-    target: str = Form(...),
-) -> Response:
-    """
-    Stable conversion endpoint.
-
-    The frontend uses POST /api because this exact function URL
-    is reliably available in both local FastAPI and Vercel.
-    """
-    return await convert_upload(
-        file,
-        target,
-    )
-
 
 @app.get("/")
 def service_root() -> dict[str, Any]:
